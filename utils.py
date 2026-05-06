@@ -275,6 +275,7 @@ def export_nifti(datasets: list, output_path: str | Path, patient_name: str) -> 
     )  # shape (Y, X, Z) — NIfTI convention
 
     volume = np.transpose(volume,[1,0,2])
+    volume = volume[:,:,::-1]
 
     affine = _build_affine(datasets)
     img    = nib.Nifti1Image(volume, affine)
