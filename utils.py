@@ -44,8 +44,82 @@ def generate_name(seed: str | None = None) -> str:
 
 # ── DICOM loading ─────────────────────────────────────────────────────────────
 
-def load_dicom_series(path: str | Path) -> tuple[np.ndarray, list, dict]:
+_SKIP_NAMES = {"DICOMDIR", "DICOMDIR.dcm", ".DS_Store"}
+
+def _find_dicom_files(path: Path) -> list[Path]:
+    """Return all DICOM image candidate files under *path* recursively.
+
+    Strategy:
+    1. Collect files with known DICOM extensions (.dcm / .ima).
+    2. Also collect all extension-less files (common on CD/DVD exports where
+       every file is a DICOM slice with no suffix).
+    3. Skip DICOMDIR index files and OS metadata.
+    The two sets are merged and de-duplicated.
+    """
+    def _keep(f: Path) -> bool:
+        return f.is_file() and f.name not in _SKIP_NAMES
+
+    by_ext: set[Path] = set()
+    for pat in ("*.dcm", "*.DCM", "*.ima", "*.IMA"):
+        by_ext.update(f for f in path.rglob(pat) if _keep(f))
+
+    # Files with no suffix — typical on DICOM CD/DVD media
+    no_ext: set[Path] = {
+        f for f in path.rglob("*") if _keep(f) and f.suffix == ""
+    }
+
+    return sorted(by_ext | no_ext)
+
+
+def scan_dicom_folder(path: str | Path) -> list[dict]:
+    """Read DICOM headers only (no pixel data) and group by SeriesInstanceUID.
+
+    Returns a list of series dicts sorted by n_slices descending::
+
+        [{"uid": ..., "description": ..., "modality": ...,
+          "rows": ..., "cols": ..., "n_slices": ...}, ...]
+
+    Returns an empty list for a single-file path.
+    """
+    path = Path(path)
+    if not path.is_dir():
+        return []
+
+    candidates: list[Path] = _find_dicom_files(path)
+
+    series: dict[str, dict] = {}
+    for f in candidates:
+        try:
+            ds = pydicom.dcmread(str(f), stop_before_pixels=True, force=True)
+            uid = str(getattr(ds, "SeriesInstanceUID", "") or f"no_uid_{f.parent.name}")
+            if uid not in series:
+                series[uid] = {
+                    "uid":         uid,
+                    "description": str(getattr(ds, "SeriesDescription", "") or ""),
+                    "modality":    str(getattr(ds, "Modality",           "") or ""),
+                    "rows":        int(getattr(ds, "Rows",               0)  or 0),
+                    "cols":        int(getattr(ds, "Columns",            0)  or 0),
+                    "n_slices":    0,
+                }
+            series[uid]["n_slices"] += 1
+        except Exception:
+            continue
+
+    return sorted(series.values(), key=lambda s: s["n_slices"], reverse=True)
+
+
+def load_dicom_series(
+    path: str | Path,
+    series_uid: str | None = None,
+) -> tuple[np.ndarray, list, dict]:
     """Load a DICOM series from *path* (file or directory).
+
+    Parameters
+    ----------
+    path       : file or directory to search
+    series_uid : if given, only slices whose SeriesInstanceUID matches are loaded;
+                 pass None to load all files (only safe when the folder contains
+                 exactly one series, or when *path* is a single file)
 
     Returns
     -------
@@ -54,25 +128,24 @@ def load_dicom_series(path: str | Path) -> tuple[np.ndarray, list, dict]:
     meta     : dict with display metadata and window/level defaults
     """
     path = Path(path)
-    candidates: list[Path] = []
-    if path.is_dir():
-        for pat in ("*.dcm", "*.DCM", "*.ima", "*.IMA"):
-            candidates.extend(sorted(path.rglob(pat)))
-        if not candidates:
-            candidates = [f for f in path.iterdir() if f.is_file()]
-    else:
-        candidates = [path]
+    candidates: list[Path] = _find_dicom_files(path) if path.is_dir() else [path]
 
     datasets: list = []
     for f in candidates:
         try:
             ds = pydicom.dcmread(str(f), force=True)
+            if series_uid is not None:
+                ds_uid = str(getattr(ds, "SeriesInstanceUID", "") or "")
+                if ds_uid != series_uid:
+                    continue
             _ = ds.pixel_array  # ensure pixel data is present
             datasets.append(ds)
         except Exception as e:
-            print(str(e))
+            print(f'Exception while loading {f}: {e}')
             continue
 
+    print(f'Successfully loaded {len(datasets)} DICOM files'
+          + (f' for series {series_uid}' if series_uid else ''))
     if not datasets:
         raise ValueError(f"No valid DICOM files with pixel data found in: {path}")
 

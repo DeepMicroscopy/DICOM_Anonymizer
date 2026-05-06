@@ -24,7 +24,8 @@ from PyQt6.QtWidgets import (
     QSplitter, QGroupBox, QLabel, QLineEdit, QPushButton, QCheckBox,
     QSlider, QComboBox, QScrollArea, QFileDialog, QMessageBox,
     QStackedWidget, QRadioButton, QButtonGroup, QFrame, QToolBar,
-    QSpinBox, QSizePolicy,
+    QSpinBox, QSizePolicy, QDialog, QTableWidget, QTableWidgetItem,
+    QHeaderView, QDialogButtonBox,
 )
 from PyQt6.QtCore import Qt, QSettings, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QFont, QGuiApplication
@@ -555,8 +556,9 @@ class _RightPanel(QScrollArea):
 
 # ── Worker threads ────────────────────────────────────────────────────────────
 
-class _LoadWorker(QThread):
-    done  = pyqtSignal(object, object, object)
+class _ScanWorker(QThread):
+    """Quickly read DICOM headers to discover which series are present."""
+    done  = pyqtSignal(list)   # list of series dicts from utils.scan_dicom_folder
     error = pyqtSignal(str)
 
     def __init__(self, path: str) -> None:
@@ -565,10 +567,29 @@ class _LoadWorker(QThread):
 
     def run(self) -> None:
         try:
-            volume, datasets, meta = utils.load_dicom_series(self._path)
-            self.done.emit(volume, datasets, meta)
+            series = utils.scan_dicom_folder(self._path)
+            self.done.emit(series)
         except Exception as exc:
             self.error.emit(str(exc))
+
+
+class _LoadWorker(QThread):
+    done  = pyqtSignal(object, object, object)
+    error = pyqtSignal(str)
+
+    def __init__(self, path: str, series_uid: str | None = None) -> None:
+        super().__init__()
+        self._path       = path
+        self._series_uid = series_uid
+
+    def run(self) -> None:
+        try:
+            volume, datasets, meta = utils.load_dicom_series(
+                self._path, self._series_uid
+            )
+            self.done.emit(volume, datasets, meta)
+        except Exception as exc:
+            self.error.emit('Error in _LoadWorker: ' + str(exc))
 
 
 class _ExportWorker(QThread):
@@ -586,7 +607,7 @@ class _ExportWorker(QThread):
             utils.export_nifti(self._datasets, self._output, self._name)
             self.done.emit(self._output)
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit('Error in _ExportWorker'+str(exc))
 
 
 class _ConnectWorker(QThread):
@@ -636,6 +657,78 @@ class _UploadWorker(QThread):
             self.done.emit(result)
         except Exception as exc:
             self.error.emit(str(exc))
+
+
+# ── Series picker dialog ──────────────────────────────────────────────────────
+
+class _SeriesPickerDialog(QDialog):
+    """Modal dialog shown when a folder contains more than one DICOM series."""
+
+    def __init__(self, series_list: list[dict], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Select DICOM Series")
+        self.setModal(True)
+        self.resize(660, 280)
+        self._series = series_list
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        lbl = QLabel(
+            f"<b>{len(series_list)} series</b> found in this folder — "
+            "select one to load:"
+        )
+        lbl.setStyleSheet("color:#d8ddf0;font-size:13px;padding-bottom:4px;")
+        layout.addWidget(lbl)
+
+        self._table = QTableWidget(len(series_list), 4)
+        self._table.setHorizontalHeaderLabels(
+            ["Series Description", "Modality", "Slices", "Image Size"]
+        )
+        self._table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self._table.horizontalHeader().setDefaultAlignment(
+            Qt.AlignmentFlag.AlignLeft
+        )
+        self._table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setAlternatingRowColors(True)
+        self._table.setStyleSheet(
+            "QTableWidget{background:#1a1e30;alternate-background-color:#1e2340;"
+            "gridline-color:#252a42;color:#d8ddf0;}"
+            "QTableWidget::item:selected{background:#2d52c0;}"
+            "QHeaderView::section{background:#1e2340;color:#7fa8ff;"
+            "font-weight:700;font-size:11px;padding:4px;border:none;"
+            "border-bottom:1px solid #252a42;}"
+        )
+
+        for row, s in enumerate(series_list):
+            desc = s.get("description", "") or "(no description)"
+            self._table.setItem(row, 0, QTableWidgetItem(desc))
+            self._table.setItem(row, 1, QTableWidgetItem(s.get("modality", "")))
+            self._table.setItem(row, 2, QTableWidgetItem(str(s.get("n_slices", "?"))))
+            size = f"{s.get('rows', '?')} × {s.get('cols', '?')}"
+            self._table.setItem(row, 3, QTableWidgetItem(size))
+
+        self._table.selectRow(0)
+        self._table.doubleClicked.connect(self.accept)
+        layout.addWidget(self._table)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Load Selected")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def selected_uid(self) -> str | None:
+        row = self._table.currentRow()
+        return self._series[row]["uid"] if row >= 0 else None
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -746,9 +839,31 @@ class MainWindow(QMainWindow):
             self._load_path(path)
 
     def _load_path(self, path: str) -> None:
-        self.statusBar().showMessage(f"Loading {path} …")
         self._viewer.clear()
-        worker = _LoadWorker(path)
+        if Path(path).is_dir():
+            self.statusBar().showMessage(f"Scanning {path} …")
+            scanner = _ScanWorker(path)
+            scanner.done.connect(lambda series: self._on_scanned(path, series))
+            scanner.error.connect(self._on_load_error)
+            self._workers.append(scanner)
+            scanner.start()
+        else:
+            self._start_load(path, series_uid=None)
+
+    def _on_scanned(self, path: str, series: list[dict]) -> None:
+        if len(series) <= 1:
+            uid = series[0]["uid"] if series else None
+            self._start_load(path, uid)
+        else:
+            dlg = _SeriesPickerDialog(series, parent=self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                self.statusBar().showMessage("Load cancelled.")
+                return
+            self._start_load(path, dlg.selected_uid())
+
+    def _start_load(self, path: str, series_uid: str | None) -> None:
+        self.statusBar().showMessage(f"Loading {path} …")
+        worker = _LoadWorker(path, series_uid)
         worker.done.connect(self._on_loaded)
         worker.error.connect(self._on_load_error)
         self._workers.append(worker)
@@ -776,6 +891,7 @@ class MainWindow(QMainWindow):
         )
 
     def _on_load_error(self, msg: str) -> None:
+        print('Showing message: ',msg)
         self.statusBar().showMessage("Load failed.")
         QMessageBox.critical(self, "DICOM Load Error", msg)
 
