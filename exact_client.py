@@ -23,14 +23,44 @@ from __future__ import annotations
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+
+
+class _StaleConnectionAdapter(HTTPAdapter):
+    """Retry once on 'Remote end closed connection without response'.
+
+    Both the Django dev server and nginx close idle keep-alive connections
+    after a short timeout.  When requests tries to reuse such a dead socket
+    the OS lets the send succeed, but reading the response raises
+    RemoteDisconnected (wrapped as ConnectionError by requests).
+    One transparent retry is enough: urllib3 always opens a fresh socket on
+    retry, so the second attempt succeeds.
+    """
+
+    def send(self, request, **kwargs):
+        try:
+            return super().send(request, **kwargs)
+        except requests.exceptions.ConnectionError:
+            return super().send(request, **kwargs)
+
+
+def _make_session() -> requests.Session:
+    session = requests.Session()
+    session.headers["Accept"] = "application/json"
+    # Disable persistent connections — avoids stale-socket errors with nginx
+    # and Django's dev server without any timing dependency.
+    session.headers["Connection"] = "close"
+    adapter = _StaleConnectionAdapter()
+    session.mount("http://",  adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 class ExactClient:
     def __init__(self, base_url: str = "") -> None:
         self.base_url = base_url.rstrip("/")
         self.token: str | None = None
-        self._session = requests.Session()
-        self._session.headers["Accept"] = "application/json"
+        self._session = _make_session()
 
     # ── Configuration ─────────────────────────────────────────────────────────
 
@@ -72,6 +102,20 @@ class ExactClient:
 
     # ── Image sets ────────────────────────────────────────────────────────────
 
+    def _fix_url_scheme(self, url: str) -> str:
+        """Ensure paginated 'next' URLs use the same scheme as base_url.
+
+        The EXACT server sometimes returns http:// in pagination links even
+        when running behind an HTTPS reverse proxy.  nginx drops plain-HTTP
+        connections silently, causing RemoteDisconnected on the second page.
+        """
+        from urllib.parse import urlparse, urlunparse
+        base_scheme = urlparse(self.base_url).scheme   # "https"
+        parts = urlparse(url)
+        if parts.scheme != base_scheme:
+            url = urlunparse(parts._replace(scheme=base_scheme))
+        return url
+
     def get_image_sets(self) -> list[dict]:
         """Return all image sets the authenticated user can access."""
         url: str | None = f"{self.base_url}/api/v1/images/image_sets/"
@@ -84,7 +128,8 @@ class ExactClient:
                 results.extend(data)
                 break
             results.extend(data.get("results", []))
-            url = data.get("next")  # type: ignore[assignment]
+            next_url = data.get("next")
+            url = self._fix_url_scheme(next_url) if next_url else None
         return results
 
     # ── Upload ────────────────────────────────────────────────────────────────
